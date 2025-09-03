@@ -16,17 +16,12 @@ def get_option_chain(symbol: str, is_index: bool = True):
     }
     session = requests.Session()
     url_base = "https://www.nseindia.com"
-
-    # First warm-up request (longer timeout)
-    session.get(f"{url_base}/option-chain", headers=headers, timeout=20)
-
+    session.get(f"{url_base}/option-chain", headers=headers, timeout=5)
     if is_index:
         api_url = f"{url_base}/api/option-chain-indices?symbol={symbol}"
     else:
         api_url = f"{url_base}/api/option-chain-equities?symbol={symbol}"
-
-    # Main API request (longer timeout)
-    resp = session.get(api_url, headers=headers, timeout=20)
+    resp = session.get(api_url, headers=headers, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -40,7 +35,7 @@ def parse_into_dfs(raw_json: dict):
         strike = itm.get("strikePrice")
         ce = itm.get("CE", {}) or {}
         pe = itm.get("PE", {}) or {}
-
+        # try to read Open Interest (OI) if present, fallback to 0
         ce_oi = ce.get("openInterest", ce.get("openInterestQty", 0)) if ce else 0
         pe_oi = pe.get("openInterest", pe.get("openInterestQty", 0)) if pe else 0
 
@@ -68,7 +63,6 @@ def parse_into_dfs(raw_json: dict):
         })
     df_calls = pd.DataFrame(call_rows)
     df_puts = pd.DataFrame(put_rows)
-
     # Ensure numeric types for arithmetic
     for df in (df_calls, df_puts):
         if not df.empty:
@@ -82,6 +76,7 @@ def parse_into_dfs(raw_json: dict):
 
 # ─── Calculate Max Pain ──────────────────────────────────────────────────────
 def calculate_max_pain(df_calls: pd.DataFrame, df_puts: pd.DataFrame):
+    # expects numeric 'Strike' and 'Volume' columns
     strikes = sorted(set(df_calls['Strike']).union(df_puts['Strike']))
     pains = []
     for p in strikes:
@@ -135,13 +130,16 @@ def main():
         return
 
     # ─── NEW: restrict to union of top-20 by Volume from each side ───────────
+    # get top 20 strikes by volume for calls and puts separately
     try:
         top_calls_strikes = set(df_calls.nlargest(20, "Volume")["Strike"].tolist())
         top_puts_strikes = set(df_puts.nlargest(20, "Volume")["Strike"].tolist())
         top_strikes_union = sorted(top_calls_strikes.union(top_puts_strikes))
     except Exception:
+        # if something goes wrong, fallback to using all strikes
         top_strikes_union = sorted(set(df_calls["Strike"]).union(df_puts["Strike"]))
 
+    # Filter dataframes to only include those strikes
     df_calls = df_calls[df_calls["Strike"].isin(top_strikes_union)].reset_index(drop=True)
     df_puts = df_puts[df_puts["Strike"].isin(top_strikes_union)].reset_index(drop=True)
 
@@ -149,26 +147,31 @@ def main():
         st.error("After filtering to top strikes there is no data to display.")
         return
 
-    # ─── PCR calculation ─────────────────────────────────────────────────────
+    # ─── PCR calculation (prefer OI, fallback to Volume) ──────────────────────
+    # Sum open interest (OI) if available and > 0, else use Volume
     calls_oi_sum = int(df_calls["OI"].sum()) if "OI" in df_calls.columns else 0
     puts_oi_sum = int(df_puts["OI"].sum()) if "OI" in df_puts.columns else 0
 
     if calls_oi_sum > 0 or puts_oi_sum > 0:
+        # Use OI-based PCR if either side has OI values
         denom = calls_oi_sum if calls_oi_sum > 0 else 1
         pcr_value = puts_oi_sum / denom if denom else None
         pcr_source = "OI"
     else:
+        # fallback to using Volume
         calls_vol_sum = int(df_calls["Volume"].sum())
         puts_vol_sum = int(df_puts["Volume"].sum())
         denom = calls_vol_sum if calls_vol_sum > 0 else 1
         pcr_value = puts_vol_sum / denom if denom else None
         pcr_source = "Volume"
 
+    # Display PCR as a metric, and textual interpretation
     if pcr_value is None:
         st.metric("PCR", "N/A", delta=None, help="PCR could not be calculated (division by zero).")
     else:
         st.metric(label=f"PCR ({pcr_source})", value=f"{pcr_value:.2f}", delta=None,
                   help=f"Put/Call ratio using {pcr_source}.")
+        # Simple interpretation
         if pcr_value < 1:
             interp = "PCR < 1 ⇒ More Calls than Puts (generally bearish)."
         elif pcr_value > 1:
@@ -177,14 +180,14 @@ def main():
             interp = "PCR ≈ 1 ⇒ Balanced positioning."
         st.caption(interp)
 
-    # Max Pain
+    # Max Pain (calculated on the filtered strikes)
     max_pain_strike, max_pain_value = calculate_max_pain(df_calls, df_puts)
     if max_pain_strike is None:
         st.info("Max Pain could not be calculated for the selected strikes.")
     else:
         st.metric("Max Pain Strike", max_pain_strike, delta=None, help=f"Total pain: {max_pain_value:.0f}")
 
-    # Display top 5
+    # Display top 5 (within the filtered top strikes union)
     st.subheader(f"Top 5 Call Strikes by Volume for {symbol} (from top-20-set)")
     st.dataframe(df_calls.nlargest(5, "Volume").reset_index(drop=True))
 
