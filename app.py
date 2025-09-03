@@ -2,8 +2,14 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
 
-# ─── Fetch & cache ─────────────────────────────────────────────────────────────
+# File for persistent Top-10 PCR storage
+PCR_FILE = "pcr_history.csv"
+
+# ─── Fetch & cache ──────────────────────────────────────────────────
 @st.cache_data(ttl=60)
 def get_option_chain(symbol: str, is_index: bool = True):
     headers = {
@@ -25,7 +31,7 @@ def get_option_chain(symbol: str, is_index: bool = True):
     resp.raise_for_status()
     return resp.json()
 
-# ─── Parse into separate Call / Put DataFrames ────────────────────────────────
+# ─── Parse into separate Call / Put DataFrames ──────────────────────
 def parse_into_dfs(raw_json: dict):
     call_rows, put_rows = [], []
     data = raw_json.get("filtered", {}).get("data") or raw_json.get("data")
@@ -74,7 +80,7 @@ def parse_into_dfs(raw_json: dict):
             df["Total Sell Qty"] = pd.to_numeric(df["Total Sell Qty"], errors="coerce").fillna(0).astype(int)
     return df_calls, df_puts
 
-# ─── Calculate Max Pain ──────────────────────────────────────────────────────
+# ─── Calculate Max Pain ─────────────────────────────────────────────
 def calculate_max_pain(df_calls: pd.DataFrame, df_puts: pd.DataFrame):
     # expects numeric 'Strike' and 'Volume' columns
     strikes = sorted(set(df_calls['Strike']).union(df_puts['Strike']))
@@ -89,16 +95,16 @@ def calculate_max_pain(df_calls: pd.DataFrame, df_puts: pd.DataFrame):
     max_row = pain_df.loc[pain_df['Pain'].idxmin()]
     return int(max_row['Strike']), max_row['Pain']
 
-# ─── Streamlit UI ────────────────────────────────────────────────────────────
+# ─── Streamlit UI ───────────────────────────────────────────────────
 def main():
     # Auto-refresh every 60 seconds
     st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
 
-    st.title("📈 NSE Option Chain – Top 5 by Volume + Buy/Sell Ratio + LTP + Max Pain + PCR")
-    st.markdown(
-        "Choose an Index or Equity to see the top 5 Call & Put strikes by volume, "
-        "their LTP, total buy/sell quantities, buy/sell ratio, Max Pain, and PCR."
-    )
+    st.title("📈 NSE Option Chain – Top-10 PCR + Top-20 PCR (OI-based)")
+    st.markdown("""Calculate two PCRs using OI only:
+- PCR Top-20 (union of top20 by Volume)
+- PCR Top-10 (union of top10 by Volume).
+Only PCR Top-10 is appended to history and plotted.""")
 
     option_type = st.sidebar.radio("Option Type", ["Index", "Equity"])
     is_index = (option_type == "Index")
@@ -123,78 +129,112 @@ def main():
     if underlying is not None:
         st.subheader(f"Underlying Price: {underlying}")
 
-    # Parse data
+    # Parse
     df_calls, df_puts = parse_into_dfs(raw)
     if df_calls.empty or df_puts.empty:
         st.error("No data available.")
         return
 
-    # ─── NEW: restrict to union of top-20 by Volume from each side ───────────
-    # get top 20 strikes by volume for calls and puts separately
+    # ─── Top-20 union (existing behavior) ─────────────────────────────
     try:
-        top_calls_strikes = set(df_calls.nlargest(20, "Volume")["Strike"].tolist())
-        top_puts_strikes = set(df_puts.nlargest(20, "Volume")["Strike"].tolist())
-        top_strikes_union = sorted(top_calls_strikes.union(top_puts_strikes))
+        top_calls_20 = set(df_calls.nlargest(20, "Volume")["Strike"].tolist())
+        top_puts_20 = set(df_puts.nlargest(20, "Volume")["Strike"].tolist())
+        top20_union = sorted(top_calls_20.union(top_puts_20))
     except Exception:
-        # if something goes wrong, fallback to using all strikes
-        top_strikes_union = sorted(set(df_calls["Strike"]).union(df_puts["Strike"]))
+        top20_union = sorted(set(df_calls["Strike"]).union(df_puts["Strike"]))
 
-    # Filter dataframes to only include those strikes
-    df_calls = df_calls[df_calls["Strike"].isin(top_strikes_union)].reset_index(drop=True)
-    df_puts = df_puts[df_puts["Strike"].isin(top_strikes_union)].reset_index(drop=True)
+    df_calls_20 = df_calls[df_calls["Strike"].isin(top20_union)].reset_index(drop=True)
+    df_puts_20 = df_puts[df_puts["Strike"].isin(top20_union)].reset_index(drop=True)
 
-    if df_calls.empty or df_puts.empty:
-        st.error("After filtering to top strikes there is no data to display.")
+    if df_calls_20.empty or df_puts_20.empty:
+        st.error("After filtering to top-20 strikes there is no data to display.")
         return
 
-    # ─── PCR calculation (prefer OI, fallback to Volume) ──────────────────────
-    # Sum open interest (OI) if available and > 0, else use Volume
-    calls_oi_sum = int(df_calls["OI"].sum()) if "OI" in df_calls.columns else 0
-    puts_oi_sum = int(df_puts["OI"].sum()) if "OI" in df_puts.columns else 0
+    # ─── Top-10 union (new) ───────────────────────────────────────────
+    try:
+        top_calls_10 = set(df_calls.nlargest(10, "Volume")["Strike"].tolist())
+        top_puts_10 = set(df_puts.nlargest(10, "Volume")["Strike"].tolist())
+        top10_union = sorted(top_calls_10.union(top_puts_10))
+    except Exception:
+        top10_union = top20_union[:10] if len(top20_union) >= 10 else top20_union
 
-    if calls_oi_sum > 0 or puts_oi_sum > 0:
-        # Use OI-based PCR if either side has OI values
-        denom = calls_oi_sum if calls_oi_sum > 0 else 1
-        pcr_value = puts_oi_sum / denom if denom else None
-        pcr_source = "OI"
-    else:
-        # fallback to using Volume
-        calls_vol_sum = int(df_calls["Volume"].sum())
-        puts_vol_sum = int(df_puts["Volume"].sum())
-        denom = calls_vol_sum if calls_vol_sum > 0 else 1
-        pcr_value = puts_vol_sum / denom if denom else None
-        pcr_source = "Volume"
+    df_calls_10 = df_calls[df_calls["Strike"].isin(top10_union)].reset_index(drop=True)
+    df_puts_10 = df_puts[df_puts["Strike"].isin(top10_union)].reset_index(drop=True)
 
-    # Display PCR as a metric, and textual interpretation
-    if pcr_value is None:
-        st.metric("PCR", "N/A", delta=None, help="PCR could not be calculated (division by zero).")
-    else:
-        st.metric(label=f"PCR ({pcr_source})", value=f"{pcr_value:.2f}", delta=None,
-                  help=f"Put/Call ratio using {pcr_source}.")
-        # Simple interpretation
-        if pcr_value < 1:
-            interp = "PCR < 1 ⇒ More Calls than Puts (generally bearish)."
-        elif pcr_value > 1:
-            interp = "PCR > 1 ⇒ More Puts than Calls (generally bullish)."
+    if df_calls_10.empty or df_puts_10.empty:
+        st.warning("Top-10 strike set is empty — Top-10 PCR cannot be computed.")
+
+    # ─── PCR calculations (OI only) ──────────────────────────────────
+    def compute_pcr_oi(calls_df, puts_df):
+        calls_oi = int(calls_df["OI"].sum()) if not calls_df.empty else 0
+        puts_oi = int(puts_df["OI"].sum()) if not puts_df.empty else 0
+        if calls_oi == 0 and puts_oi == 0:
+            return None
+        if calls_oi == 0:
+            return None  # avoid divide-by-zero; show N/A
+        return puts_oi / calls_oi
+
+    pcr_top20 = compute_pcr_oi(df_calls_20, df_puts_20)
+    pcr_top10 = compute_pcr_oi(df_calls_10, df_puts_10)
+
+    # ─── Persist only Top-10 PCR to CSV (timestamp + value) ─────────
+    if pcr_top10 is not None:
+        entry = {"timestamp": datetime.utcnow().isoformat(), "pcr_top10": pcr_top10}
+        if os.path.exists(PCR_FILE):
+            df_hist = pd.read_csv(PCR_FILE)
+            df_hist = pd.concat([df_hist, pd.DataFrame([entry])], ignore_index=True)
         else:
-            interp = "PCR ≈ 1 ⇒ Balanced positioning."
-        st.caption(interp)
-
-    # Max Pain (calculated on the filtered strikes)
-    max_pain_strike, max_pain_value = calculate_max_pain(df_calls, df_puts)
-    if max_pain_strike is None:
-        st.info("Max Pain could not be calculated for the selected strikes.")
+            df_hist = pd.DataFrame([entry])
+        df_hist.to_csv(PCR_FILE, index=False)
     else:
+        df_hist = pd.read_csv(PCR_FILE) if os.path.exists(PCR_FILE) else pd.DataFrame()
+
+    # ─── Display metrics ─────────────────────────────────────────────
+    # Show Top-20 PCR metric
+    if pcr_top20 is None:
+        st.metric("PCR (Top-20)", "N/A", delta=None, help="Computed using OI across top-20 union")
+    else:
+        st.metric("PCR (Top-20)", f"{pcr_top20:.2f}", delta=None, help="Computed using OI across top-20 union")
+
+    # Show Top-10 PCR metric
+    if pcr_top10 is None:
+        st.metric("PCR (Top-10)", "N/A", delta=None, help="Computed using OI across top-10 union")
+    else:
+        st.metric("PCR (Top-10)", f"{pcr_top10:.2f}", delta=None, help="Computed using OI across top-10 union")
+
+    # Interpretation caption for Top-10
+    if pcr_top10 is not None:
+        if pcr_top10 < 1:
+            st.caption("Top-10 PCR < 1 ⇒ More Calls than Puts (bearish bias).")
+        elif pcr_top10 > 1:
+            st.caption("Top-10 PCR > 1 ⇒ More Puts than Calls (bullish bias).")
+        else:
+            st.caption("Top-10 PCR ≈ 1 ⇒ Balanced positioning.")
+
+    # Max Pain (use df_calls_20/df_puts_20 for calculations)
+    max_pain_strike, max_pain_value = calculate_max_pain(df_calls_20, df_puts_20)
+    if max_pain_strike is not None:
         st.metric("Max Pain Strike", max_pain_strike, delta=None, help=f"Total pain: {max_pain_value:.0f}")
 
-    # Display top 5 (within the filtered top strikes union)
+    # ─── Display top-5 tables with Buy/Sell Ratio ───────────────────
     st.subheader(f"Top 5 Call Strikes by Volume for {symbol} (from top-20-set)")
-    st.dataframe(df_calls.nlargest(5, "Volume").reset_index(drop=True))
+    display_calls = df_calls_20.nlargest(5, "Volume").reset_index(drop=True)
+    st.dataframe(display_calls)
 
     st.subheader(f"Top 5 Put Strikes by Volume for {symbol} (from top-20-set)")
-    st.dataframe(df_puts.nlargest(5, "Volume").reset_index(drop=True))
+    display_puts = df_puts_20.nlargest(5, "Volume").reset_index(drop=True)
+    st.dataframe(display_puts)
 
-    st.sidebar.markdown("Data is cached for 60 seconds. Filtered to top-20 strikes per side for calculations.")
+    st.sidebar.markdown("Data is cached for 60 seconds. Top-20 used for main calculations; Top-10 used for stored PCR.")
+
+    # ─── Continuous Top-10 PCR Plot (x = entry count, y = PCR value) ──
+    if not df_hist.empty:
+        fig, ax = plt.subplots()
+        ax.plot(df_hist.index + 1, df_hist["pcr_top10"], marker="o")
+        ax.set_title("Top-10 PCR Trend (Persistent)")
+        ax.set_xlabel("Entry Count")
+        ax.set_ylabel("PCR (Top-10, OI)")
+        st.pyplot(fig)
 
 if __name__ == "__main__":
     main()
