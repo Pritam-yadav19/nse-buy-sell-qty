@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 
-# File for persistent Top-10 PCR storage
+# File for persistent Top-5 PCR storage
 PCR_FILE = "pcr_history.csv"
 
 # ─── Fetch & cache ──────────────────────────────────────────────────
@@ -22,6 +22,7 @@ def get_option_chain(symbol: str, is_index: bool = True):
     }
     session = requests.Session()
     url_base = "https://www.nseindia.com"
+    # warm-up request to obtain cookies
     session.get(f"{url_base}/option-chain", headers=headers, timeout=5)
     if is_index:
         api_url = f"{url_base}/api/option-chain-indices?symbol={symbol}"
@@ -100,11 +101,11 @@ def main():
     # Auto-refresh every 60 seconds
     st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
 
-    st.title("📈 NSE Option Chain – Top-10 PCR + Top-20 PCR (OI-based)")
-    st.markdown("""Calculate two PCRs using OI only:
+    st.title("📈 NSE Option Chain – Top-5 / Top-10 / Top-20 PCR (OI-based)")
+    st.markdown("""Calculate three PCRs using OI only:
 - PCR Top-20 (union of top20 by Volume)
-- PCR Top-10 (union of top10 by Volume).
-Only PCR Top-10 is appended to history and plotted.""")
+- PCR Top-10 (union of top10 by Volume)
+- PCR Top-5  (union of top5 by Volume) — stored & plotted""")
 
     option_type = st.sidebar.radio("Option Type", ["Index", "Equity"])
     is_index = (option_type == "Index")
@@ -150,7 +151,7 @@ Only PCR Top-10 is appended to history and plotted.""")
         st.error("After filtering to top-20 strikes there is no data to display.")
         return
 
-    # ─── Top-10 union (new) ───────────────────────────────────────────
+    # ─── Top-10 union (existing) ────────────────────────────────────
     try:
         top_calls_10 = set(df_calls.nlargest(10, "Volume")["Strike"].tolist())
         top_puts_10 = set(df_puts.nlargest(10, "Volume")["Strike"].tolist())
@@ -164,6 +165,20 @@ Only PCR Top-10 is appended to history and plotted.""")
     if df_calls_10.empty or df_puts_10.empty:
         st.warning("Top-10 strike set is empty — Top-10 PCR cannot be computed.")
 
+    # ─── Top-5 union (NEW: stored & plotted) ──────────────────────────
+    try:
+        top_calls_5 = set(df_calls.nlargest(5, "Volume")["Strike"].tolist())
+        top_puts_5 = set(df_puts.nlargest(5, "Volume")["Strike"].tolist())
+        top5_union = sorted(top_calls_5.union(top_puts_5))
+    except Exception:
+        top5_union = top10_union[:5] if len(top10_union) >= 5 else top10_union
+
+    df_calls_5 = df_calls[df_calls["Strike"].isin(top5_union)].reset_index(drop=True)
+    df_puts_5 = df_puts[df_puts["Strike"].isin(top5_union)].reset_index(drop=True)
+
+    if df_calls_5.empty or df_puts_5.empty:
+        st.warning("Top-5 strike set is empty — Top-5 PCR cannot be computed.")
+
     # ─── PCR calculations (OI only) ──────────────────────────────────
     def compute_pcr_oi(calls_df, puts_df):
         calls_oi = int(calls_df["OI"].sum()) if not calls_df.empty else 0
@@ -176,15 +191,17 @@ Only PCR Top-10 is appended to history and plotted.""")
 
     pcr_top20 = compute_pcr_oi(df_calls_20, df_puts_20)
     pcr_top10 = compute_pcr_oi(df_calls_10, df_puts_10)
+    pcr_top5  = compute_pcr_oi(df_calls_5, df_puts_5)  # stored & plotted
 
-    # ─── Persist only Top-10 PCR to CSV (timestamp + value) ─────────
-    if pcr_top10 is not None:
-        entry = {"timestamp": datetime.utcnow().isoformat(), "pcr_top10": pcr_top10}
+    # ─── Persist only Top-5 PCR to CSV (timestamp + value) ─────────
+    if pcr_top5 is not None:
+        entry = {"timestamp": datetime.utcnow().isoformat(), "pcr_top5": pcr_top5}
         if os.path.exists(PCR_FILE):
             df_hist = pd.read_csv(PCR_FILE)
             df_hist = pd.concat([df_hist, pd.DataFrame([entry])], ignore_index=True)
         else:
             df_hist = pd.DataFrame([entry])
+        # ensure column name pcr_top5 exists and save
         df_hist.to_csv(PCR_FILE, index=False)
     else:
         df_hist = pd.read_csv(PCR_FILE) if os.path.exists(PCR_FILE) else pd.DataFrame()
@@ -202,7 +219,13 @@ Only PCR Top-10 is appended to history and plotted.""")
     else:
         st.metric("PCR (Top-10)", f"{pcr_top10:.2f}", delta=None, help="Computed using OI across top-10 union")
 
-    # Interpretation caption for Top-10
+    # Show Top-5 PCR metric (new)
+    if pcr_top5 is None:
+        st.metric("PCR (Top-5)", "N/A", delta=None, help="Computed using OI across top-5 union")
+    else:
+        st.metric("PCR (Top-5)", f"{pcr_top5:.2f}", delta=None, help="Computed using OI across top-5 union")
+
+    # Interpretation caption for Top-10 and Top-5
     if pcr_top10 is not None:
         if pcr_top10 < 1:
             st.caption("Top-10 PCR < 1 ⇒ More Calls than Puts (bearish bias).")
@@ -210,6 +233,14 @@ Only PCR Top-10 is appended to history and plotted.""")
             st.caption("Top-10 PCR > 1 ⇒ More Puts than Calls (bullish bias).")
         else:
             st.caption("Top-10 PCR ≈ 1 ⇒ Balanced positioning.")
+
+    if pcr_top5 is not None:
+        if pcr_top5 < 1:
+            st.caption("Top-5 PCR < 1 ⇒ More Calls than Puts (bearish bias).")
+        elif pcr_top5 > 1:
+            st.caption("Top-5 PCR > 1 ⇒ More Puts than Calls (bullish bias).")
+        else:
+            st.caption("Top-5 PCR ≈ 1 ⇒ Balanced positioning.")
 
     # Max Pain (use df_calls_20/df_puts_20 for calculations)
     max_pain_strike, max_pain_value = calculate_max_pain(df_calls_20, df_puts_20)
@@ -225,16 +256,19 @@ Only PCR Top-10 is appended to history and plotted.""")
     display_puts = df_puts_20.nlargest(5, "Volume").reset_index(drop=True)
     st.dataframe(display_puts)
 
-    st.sidebar.markdown("Data is cached for 60 seconds. Top-20 used for main calculations; Top-10 used for stored PCR.")
+    st.sidebar.markdown("Data is cached for 60 seconds. Top-20 used for main calculations; Top-10 shown as a metric; Top-5 PCR stored & plotted.")
 
-    # ─── Continuous Top-10 PCR Plot (x = entry count, y = PCR value) ──
-    if not df_hist.empty:
-        fig, ax = plt.subplots()
-        ax.plot(df_hist.index + 1, df_hist["pcr_top10"], marker="o")
-        ax.set_title("Top-10 PCR Trend (Persistent)")
-        ax.set_xlabel("Entry Count")
-        ax.set_ylabel("PCR (Top-10, OI)")
-        st.pyplot(fig)
+    # ─── Continuous Top-5 PCR Plot (x = entry count, y = PCR value) ──
+    if not df_hist.empty and "pcr_top5" in df_hist.columns:
+        # drop rows where pcr_top5 is NaN (older files without this column may exist)
+        plot_series = df_hist["pcr_top5"].dropna().astype(float)
+        if not plot_series.empty:
+            fig, ax = plt.subplots()
+            ax.plot(plot_series.index + 1, plot_series.values, marker="o")
+            ax.set_title("Top-5 PCR Trend (Persistent)")
+            ax.set_xlabel("Entry Count")
+            ax.set_ylabel("PCR (Top-5, OI)")
+            st.pyplot(fig)
 
 if __name__ == "__main__":
     main()
