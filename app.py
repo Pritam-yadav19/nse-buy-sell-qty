@@ -5,13 +5,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
+from urllib.parse import urlencode
 
 # File for persistent Top-5 PCR storage
 PCR_FILE = "pcr_history.csv"
 
 # ─── Fetch & cache ──────────────────────────────────────────────────
 @st.cache_data(ttl=60)
-def get_option_chain(symbol: str, is_index: bool = True):
+def get_option_chain(symbol: str, is_index: bool = True, expiry: str | None = None):
+    """
+    Fetch option chain JSON from NSE.
+    If expiry is provided, include it as expiryDate query param so server returns that expiry's data.
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -19,15 +24,22 @@ def get_option_chain(symbol: str, is_index: bool = True):
             "Chrome/115.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en,hi;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
     }
     session = requests.Session()
     url_base = "https://www.nseindia.com"
     # warm-up request to obtain cookies
     session.get(f"{url_base}/option-chain", headers=headers, timeout=5)
+
     if is_index:
         api_url = f"{url_base}/api/option-chain-indices?symbol={symbol}"
     else:
         api_url = f"{url_base}/api/option-chain-equities?symbol={symbol}"
+
+    if expiry:
+        api_url = api_url + "&" + urlencode({"expiryDate": expiry})
+
     resp = session.get(api_url, headers=headers, timeout=10)
     resp.raise_for_status()
     return resp.json()
@@ -118,22 +130,68 @@ def main():
         st.error("Please enter a symbol to proceed.")
         return
 
-    with st.spinner(f"Fetching {symbol} option chain..."):
+    # 1) initial fetch to get expiry dates (no expiry param)
+    with st.spinner(f"Fetching {symbol} option chain (to get expiry dates)..."):
         try:
-            raw = get_option_chain(symbol, is_index)
+            raw_initial = get_option_chain(symbol, is_index, expiry=None)
         except Exception as e:
             st.error(f"Failed to fetch data for {symbol}: {e}")
             return
 
-    # Underlying
-    underlying = raw.get("records", {}).get("underlyingValue")
-    if underlying is not None:
-        st.subheader(f"Underlying Price: {underlying}")
+    records = raw_initial.get("records", {}) or {}
+    expiry_dates = records.get("expiryDates", []) if records else []
+    default_expiry = records.get("expiryDate") if records else None
 
-    # Parse
-    df_calls, df_puts = parse_into_dfs(raw)
+    # Single dropdown for expiry (sidebar). If no expiry list, keep behaviour unchanged.
+    if expiry_dates:
+        try:
+            default_index = expiry_dates.index(default_expiry) if default_expiry in expiry_dates else 0
+        except Exception:
+            default_index = 0
+        selected_expiry = st.sidebar.selectbox("Expiry Date", expiry_dates, index=default_index)
+        st.subheader(f"Selected Expiry: {selected_expiry}")
+    else:
+        selected_expiry = None
+
+    # 2) fetch data for the selected expiry so that returned 'data' contains strikes for that expiry
+    with st.spinner(f"Fetching {symbol} option chain for expiry {selected_expiry or 'default'}..."):
+        try:
+            raw = get_option_chain(symbol, is_index, expiry=selected_expiry)
+        except Exception as e:
+            st.error(f"Failed to fetch option chain for expiry {selected_expiry}: {e}")
+            return
+
+    # Prepare data list from the response
+    data_all = raw.get("filtered", {}).get("data") or raw.get("data")
+    if data_all is None:
+        st.error("No option-chain data present in the API response.")
+        return
+
+    # If server returned other expiries for some reason, try to filter defensively (but normally server returns the requested expiry)
+    if selected_expiry:
+        filtered_data = [itm for itm in data_all if itm.get("expiryDate") == selected_expiry]
+        # if nothing matches by string equality, fall back to data_all (some responses already correspond to the expiry)
+        if not filtered_data:
+            # inspect a few items to decide: if first item's expiryDate equals selected_expiry when normalized,
+            # then use data_all. But simplest: if data_all items have expiryDate at all and differ, keep filtered_data empty.
+            # For robustness, we'll proceed with data_all if every item has the same expiryDate equal to selected_expiry
+            all_expiries = set(itm.get("expiryDate") for itm in data_all if itm.get("expiryDate") is not None)
+            if len(all_expiries) == 1 and (selected_expiry in all_expiries):
+                filtered_data = data_all
+    else:
+        filtered_data = data_all
+
+    if not filtered_data:
+        st.warning("No strikes found for the selected expiry. Try a different expiry or symbol.")
+        return
+
+    # create a lightweight filtered raw structure for parsing function
+    raw_filtered = {"data": filtered_data, "records": records}
+
+    # Parse filtered data
+    df_calls, df_puts = parse_into_dfs(raw_filtered)
     if df_calls.empty or df_puts.empty:
-        st.error("No data available.")
+        st.error("No data available after parsing for the selected expiry.")
         return
 
     # ─── Top-20 union (existing behavior) ─────────────────────────────
@@ -201,7 +259,7 @@ def main():
             df_hist = pd.concat([df_hist, pd.DataFrame([entry])], ignore_index=True)
         else:
             df_hist = pd.DataFrame([entry])
-        # ensure column name pcr_top5 exists and save
+        # Important: do NOT add expiry column to CSV (as requested)
         df_hist.to_csv(PCR_FILE, index=False)
     else:
         df_hist = pd.read_csv(PCR_FILE) if os.path.exists(PCR_FILE) else pd.DataFrame()
