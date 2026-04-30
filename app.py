@@ -104,8 +104,8 @@ def parse_oi_change(raw_json):
     df_puts = pd.DataFrame(put_rows)
 
     # Filter for meaningful open interest
-    df_calls = df_calls[df_calls["OI"] > 20000]
-    df_puts = df_puts[df_puts["OI"] > 20000]
+    df_calls = df_calls[df_calls["OI"] > 30000]
+    df_puts = df_puts[df_puts["OI"] > 30000]
 
     # Remove extreme noise (garbage spikes)
     df_calls = df_calls[df_calls["OI Change %"] < 500]
@@ -161,9 +161,9 @@ def main():
         st.error("No usable data (filtered out or blocked)")
         return
 
-    # Top 3 based on decreasing OI Change % (max first)
-    top_calls = df_calls.sort_values(by="OI Change %", ascending=False).head(3)
-    top_puts = df_puts.sort_values(by="OI Change %", ascending=False).head(3)
+    # Top 5 based on decreasing OI Change % (max first)
+    top_calls = df_calls.sort_values(by="OI Change %", ascending=False).head(5)
+    top_puts = df_puts.sort_values(by="OI Change %", ascending=False).head(5)
 
     col1, col2 = st.columns(2)
 
