@@ -165,6 +165,10 @@ def main():
     top_calls = df_calls.sort_values(by="OI Change %", ascending=False).head(5)
     top_puts = df_puts.sort_values(by="OI Change %", ascending=False).head(5)
 
+    # Lowest 5 based on OI Change % (minimum first - negative values)
+    low_oi_calls = df_calls.sort_values(by="OI Change %", ascending=True).head(5)
+    low_oi_puts = df_puts.sort_values(by="OI Change %", ascending=True).head(5)
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -178,6 +182,22 @@ def main():
         st.subheader("🔥 Top Puts (Real Activity)")
         st.dataframe(
             top_puts[["Strike", "OI", "OI Change %", "IV"]].reset_index(drop=True),
+            use_container_width=True,
+        )
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.subheader("📉 Lowest OI Change Calls")
+        st.dataframe(
+            low_oi_calls[["Strike", "OI", "OI Change %", "IV"]].reset_index(drop=True),
+            use_container_width=True,
+        )
+
+    with col4:
+        st.subheader("📉 Lowest OI Change Puts")
+        st.dataframe(
+            low_oi_puts[["Strike", "OI", "OI Change %", "IV"]].reset_index(drop=True),
             use_container_width=True,
         )
 
