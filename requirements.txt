@@ -3,4 +3,3 @@ pandas
 numpy
 requests
 matplotlib
-nsepython==2.97
